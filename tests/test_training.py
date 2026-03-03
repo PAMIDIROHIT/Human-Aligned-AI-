@@ -87,8 +87,8 @@ def test_sft_trainer_returns_losses(tmp_path):
     assert all(isinstance(l, float) for l in losses)
 
 
-def test_sft_trainer_loss_decreases_trend(tmp_path):
-    """Loss should be a finite number."""
+def test_sft_trainer_loss_is_finite(tmp_path):
+    """Loss values returned by the SFT trainer must all be finite numbers."""
     from rlhf.config import SFTConfig
     from rlhf.data.dataset import PromptDataset
     from rlhf.training.sft_trainer import SFTTrainer
