@@ -1,0 +1,168 @@
+# ============================================================
+# RLHF Pipeline — Centralized Hyperparameters
+# All training scripts read from this file via yaml.safe_load
+# ============================================================
+
+# ---- Global ----
+global:
+  seed: 42
+  base_model: "meta-llama/Llama-3.2-1B"
+  max_seq_length: 512
+  mlflow_tracking_uri: "http://localhost:5000"
+
+# ---- Stage 1: Supervised Fine-Tuning (QLoRA) ----
+sft:
+  dataset: "tatsu-lab/alpaca"
+  output_dir: "models/sft_adapter"
+  experiment_name: "rlhf-sft"
+
+  # QLoRA config
+  qlora:
+    r: 64
+    lora_alpha: 16
+    target_modules: ["q_proj", "v_proj"]
+    lora_dropout: 0.05
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+  # BitsAndBytes quantization
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_compute_dtype: "float16"
+    bnb_4bit_use_double_quant: true
+
+  # Training arguments
+  training:
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 4
+    warmup_ratio: 0.03
+    num_train_epochs: 3
+    learning_rate: 2.0e-4
+    fp16: true
+    logging_steps: 10
+    save_strategy: "epoch"
+    evaluation_strategy: "epoch"
+    packing: true
+    optim: "paged_adamw_32bit"
+    weight_decay: 0.001
+    max_grad_norm: 0.3
+    lr_scheduler_type: "cosine"
+
+  # Evaluation gate
+  eval_gate:
+    max_perplexity: 15.0
+    val_split_ratio: 0.1
+
+# ---- Stage 2: Reward Model (Bradley-Terry) ----
+reward_model:
+  dataset: "Anthropic/hh-rlhf"
+  output_dir: "models/reward_model"
+  experiment_name: "rlhf-reward-model"
+
+  # Model config
+  model:
+    freeze_layers_except_last_n: 2
+    reward_head_hidden_size: null  # auto from model config
+
+  # Training arguments
+  training:
+    per_device_train_batch_size: 8
+    gradient_accumulation_steps: 1
+    num_train_epochs: 1
+    learning_rate: 1.0e-5
+    warmup_steps: 100
+    fp16: true
+    logging_steps: 10
+    save_strategy: "epoch"
+    evaluation_strategy: "steps"
+    eval_steps: 200
+    optim: "adamw_torch"
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    lr_scheduler_type: "linear"
+    max_length: 512
+
+  # Evaluation gate
+  eval_gate:
+    min_accuracy: 0.60
+    min_reward_margin_ratio: 0.60
+
+# ---- Stage 3: PPO Policy Optimization ----
+ppo:
+  dataset: "Anthropic/hh-rlhf"
+  output_dir: "models/ppo_policy"
+  experiment_name: "rlhf-ppo"
+
+  # PPO config
+  config:
+    learning_rate: 1.41e-5
+    batch_size: 128
+    mini_batch_size: 32
+    gradient_accumulation_steps: 1
+    optimize_cuda_cache: true
+    early_stopping: true
+    target_kl: 0.1
+    kl_penalty: "kl"
+    use_score_scaling: true
+    use_score_norm: true
+    ppo_epochs: 4
+    cliprange: 0.2
+    cliprange_value: 0.2
+    vf_coef: 0.1
+    max_grad_norm: 0.5
+
+  # Generation config
+  generation:
+    max_new_tokens: 200
+    temperature: 0.7
+    top_k: 0
+    top_p: 1.0
+    do_sample: true
+
+  # KL controller
+  kl_controller:
+    init_kl_coef: 0.2
+    target_kl: 0.1
+    horizon: 10000
+    kl_lr: 0.1  # PID learning rate for KL coef
+
+  # GAE
+  gae:
+    gamma: 1.0
+    lam: 0.95
+
+  # Training loop
+  training:
+    total_steps: 2000
+    log_every_n_steps: 10
+    save_every_n_steps: 500
+    eval_every_n_steps: 100
+
+  # Evaluation gate
+  eval_gate:
+    max_kl: 0.15
+    min_reward_improvement: 0.1
+
+# ---- Evaluation ----
+evaluation:
+  mt_bench_questions_path: "data/mt_bench_questions.json"
+  output_path: "reports/mt_bench_scores.json"
+  kl_reward_plot_path: "reports/kl_reward_tradeoff.png"
+  judge_model: "gpt-4"
+  num_questions: 80
+  categories:
+    - writing
+    - roleplay
+    - reasoning
+    - math
+    - coding
+    - extraction
+    - stem
+    - humanities
+
+# ---- Prometheus Metrics ----
+monitoring:
+  prometheus_port: 9090
+  grafana_port: 3000
+  metrics_push_gateway: "http://localhost:9091"

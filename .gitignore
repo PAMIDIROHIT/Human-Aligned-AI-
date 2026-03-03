@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# DVC
+/data/*.dvc
+.dvc/tmp/
+.dvc/cache/
+
+# Models (tracked by DVC, not git)
+models/sft_adapter/*.bin
+models/sft_adapter/*.safetensors
+models/reward_model/*.bin
+models/reward_model/*.safetensors
+models/ppo_policy/*.bin
+models/ppo_policy/*.safetensors
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Reports (generated)
+reports/*.png
+reports/*.csv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.pem

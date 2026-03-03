@@ -1,0 +1,26 @@
+# Prometheus Configuration for RLHF Pipeline
+# Scrapes PPO training metrics exposed via prometheus_client
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # PPO training metrics (exposed by src/stage3_ppo/train.py)
+  - job_name: 'ppo_training'
+    static_configs:
+      - targets: ['localhost:9091']
+        labels:
+          pipeline: 'rlhf'
+          stage: 'ppo'
+
+  # Node exporter (optional, for system metrics)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+
+  # MLflow server metrics (if available)
+  - job_name: 'mlflow'
+    static_configs:
+      - targets: ['localhost:5000']
+    metrics_path: /metrics

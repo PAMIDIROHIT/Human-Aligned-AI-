@@ -1,0 +1,304 @@
+# ============================================================
+# RLHF Pipeline — Stage-Gate CI/CD
+# Each stage is evaluated before the next stage runs
+# ============================================================
+
+name: RLHF Pipeline CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  MLFLOW_TRACKING_URI: "http://localhost:5000"
+  TOKENIZERS_PARALLELISM: "false"
+  WANDB_DISABLED: "true"
+
+jobs:
+  # ---- Job 0: Lint & Type Check ----
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ruff mypy pytest
+          pip install -r requirements.txt
+
+      - name: Lint with ruff
+        run: ruff check src/ tests/
+
+      - name: Type check (non-strict)
+        run: mypy src/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+
+  # ---- Job 1: Stage 1 — SFT Training + Evaluation Gate ----
+  stage1_eval_gate:
+    needs: lint
+    runs-on: ubuntu-latest
+    # In production, use a GPU runner: runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore DVC cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .dvc/cache
+            models/sft_adapter
+          key: dvc-sft-${{ hashFiles('params.yaml', 'src/stage1_sft/**') }}
+          restore-keys: dvc-sft-
+
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 0.0.0.0 --port 5000 &
+          sleep 5
+
+      - name: Run SFT Training
+        run: python -m src.stage1_sft.train --config params.yaml
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Run SFT Evaluation Gate
+        run: |
+          python -m src.stage1_sft.evaluate --config params.yaml
+          # Exit code != 0 if perplexity > threshold
+
+      - name: Upload SFT adapter artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-adapter
+          path: models/sft_adapter/
+          retention-days: 7
+
+      - name: Upload SFT metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-metrics
+          path: reports/sft_*.json
+
+  # ---- Job 2: Stage 2 — Reward Model Training + Evaluation Gate ----
+  stage2_eval_gate:
+    needs: stage1_eval_gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download SFT adapter
+        uses: actions/download-artifact@v4
+        with:
+          name: sft-adapter
+          path: models/sft_adapter/
+
+      - name: Restore DVC cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .dvc/cache
+            models/reward_model
+          key: dvc-rm-${{ hashFiles('params.yaml', 'src/stage2_reward/**') }}
+          restore-keys: dvc-rm-
+
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 0.0.0.0 --port 5000 &
+          sleep 5
+
+      - name: Run Reward Model Training
+        run: python -m src.stage2_reward.train --config params.yaml
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Run RM Evaluation Gate
+        run: |
+          python -m src.stage2_reward.evaluate --config params.yaml
+          # Exit code != 0 if accuracy < 60%
+
+      - name: Upload Reward Model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reward-model
+          path: models/reward_model/
+          retention-days: 7
+
+      - name: Upload RM metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: rm-metrics
+          path: reports/rm_*.json
+
+  # ---- Job 3: Stage 3 — PPO Training + Evaluation Gate ----
+  stage3_eval_gate:
+    needs: stage2_eval_gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download SFT adapter
+        uses: actions/download-artifact@v4
+        with:
+          name: sft-adapter
+          path: models/sft_adapter/
+
+      - name: Download Reward Model
+        uses: actions/download-artifact@v4
+        with:
+          name: reward-model
+          path: models/reward_model/
+
+      - name: Restore DVC cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .dvc/cache
+            models/ppo_policy
+          key: dvc-ppo-${{ hashFiles('params.yaml', 'src/stage3_ppo/**') }}
+          restore-keys: dvc-ppo-
+
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 0.0.0.0 --port 5000 &
+          sleep 5
+
+      - name: Run PPO Training
+        run: python -m src.stage3_ppo.train --config params.yaml
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Run PPO Evaluation Gate
+        run: |
+          python -m src.stage3_ppo.evaluate --config params.yaml
+          # Exit code != 0 if KL > threshold or reward didn't improve
+
+      - name: Upload PPO Policy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppo-policy
+          path: models/ppo_policy/
+          retention-days: 7
+
+      - name: Upload PPO metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppo-metrics
+          path: reports/ppo_*.json
+
+  # ---- Job 4: MT-Bench Final Evaluation ----
+  mt_bench:
+    needs: stage3_eval_gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download all model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: models/
+
+      - name: Reorganize model directories
+        run: |
+          # Flatten download structure
+          mv models/sft-adapter/* models/sft_adapter/ 2>/dev/null || true
+          mv models/reward-model/* models/reward_model/ 2>/dev/null || true
+          mv models/ppo-policy/* models/ppo_policy/ 2>/dev/null || true
+
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 0.0.0.0 --port 5000 &
+          sleep 5
+
+      - name: Run MT-Bench Evaluation
+        run: python -m src.evaluation.mt_bench --config params.yaml
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          LANGCHAIN_API_KEY: ${{ secrets.LANGCHAIN_API_KEY }}
+          LANGCHAIN_TRACING_V2: "true"
+          LANGCHAIN_PROJECT: "rlhf-pipeline-eval"
+
+      - name: Generate KL-Reward Tradeoff Plot
+        run: python -m src.evaluation.kl_reward_tradeoff --config params.yaml
+
+      - name: Upload final evaluation reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Post MT-Bench scores as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const scores = JSON.parse(fs.readFileSync('reports/mt_bench_scores.json', 'utf8'));
+            const body = `## MT-Bench Evaluation Results\n\n` +
+              `| Model | Score |\n|-------|-------|\n` +
+              `| Base | ${scores.base_score?.toFixed(2) || 'N/A'} |\n` +
+              `| SFT | ${scores.sft_score?.toFixed(2) || 'N/A'} |\n` +
+              `| PPO | ${scores.ppo_score?.toFixed(2) || 'N/A'} |\n\n` +
+              `Improvement: SFT→PPO = +${((scores.ppo_score - scores.sft_score) || 0).toFixed(2)}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
