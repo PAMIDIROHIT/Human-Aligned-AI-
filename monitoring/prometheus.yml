@@ -1,26 +1,36 @@
-# Prometheus Configuration for RLHF Pipeline
-# Scrapes PPO training metrics exposed via prometheus_client
+# Prometheus Configuration for RLHF Pipeline Remote Monitoring
+# Deploy this file on your LAPTOP's Prometheus instance.
+#
+# The GPU server exposes metrics on port 9091 (bound to 0.0.0.0).
+# Replace <GPU_SERVER_IP> with the actual IP of your campus GPU server.
+#
+# To find the server IP, run on the GPU server:
+#   hostname -I | awk '{print $1}'
+#
+# Start Prometheus on your laptop with:
+#   prometheus --config.file=prometheus.yml
 
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
 scrape_configs:
-  # PPO training metrics (exposed by src/stage3_ppo/train.py)
-  - job_name: 'ppo_training'
+  # RLHF Training Metrics (exposed by PPO training script)
+  - job_name: "rlhf-training"
     static_configs:
-      - targets: ['localhost:9091']
+      - targets: ["<GPU_SERVER_IP>:9091"]
         labels:
-          pipeline: 'rlhf'
-          stage: 'ppo'
+          instance: "campus-gpu-server"
+          project: "rlhf-pipeline"
 
-  # Node exporter (optional, for system metrics)
-  - job_name: 'node'
+  # MLflow Metrics (if MLflow server is running)
+  - job_name: "mlflow"
     static_configs:
-      - targets: ['localhost:9100']
-
-  # MLflow server metrics (if available)
-  - job_name: 'mlflow'
-    static_configs:
-      - targets: ['localhost:5000']
+      - targets: ["<GPU_SERVER_IP>:5000"]
+        labels:
+          instance: "campus-gpu-server"
+          service: "mlflow"
     metrics_path: /metrics
+    # MLflow may not expose Prometheus metrics natively
+    # Use mlflow-prometheus-exporter if needed
+    scrape_interval: 30s

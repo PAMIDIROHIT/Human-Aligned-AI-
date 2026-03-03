@@ -1,7 +1,7 @@
-"""Stage 3 PPO — Evaluation script with KL and reward gate checks.
+"""Stage 3 PPO -- Evaluation script with KL and reward gate checks.
 
-Evaluates the PPO policy by checking that KL divergence is within bounds
-and that reward has improved relative to the SFT baseline.
+Hardware target: 4x Tesla K80 (fp32).
+Compatible with: transformers==4.38.2
 
 Usage:
     python -m src.stage3_ppo.evaluate --config params.yaml
@@ -19,12 +19,7 @@ import mlflow
 import numpy as np
 import torch
 import yaml
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    set_seed,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,16 +32,16 @@ def generate_responses(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     prompts: list[str],
-    max_new_tokens: int = 200,
+    max_new_tokens: int = 128,
     temperature: float = 0.7,
 ) -> list[str]:
-    """Generate responses from a causal LM given prompts.
+    """Generate responses from a causal LM.
 
     Args:
         model: The causal language model.
-        tokenizer: The tokenizer for the model.
+        tokenizer: The tokenizer.
         prompts: List of prompt strings.
-        max_new_tokens: Maximum number of new tokens to generate.
+        max_new_tokens: Maximum new tokens.
         temperature: Sampling temperature.
 
     Returns:
@@ -71,7 +66,6 @@ def generate_responses(
                 pad_token_id=tokenizer.pad_token_id,
             )
 
-        # Only decode the new tokens
         new_tokens = outputs[0][input_ids.shape[1]:]
         response = tokenizer.decode(new_tokens, skip_special_tokens=True)
         responses.append(response)
@@ -79,53 +73,11 @@ def generate_responses(
     return responses
 
 
-def score_with_rm(
-    reward_model: torch.nn.Module,
-    tokenizer: AutoTokenizer,
-    prompts: list[str],
-    responses: list[str],
-    max_length: int = 512,
-) -> np.ndarray:
-    """Score prompt-response pairs using the reward model.
-
-    Args:
-        reward_model: The frozen reward model.
-        tokenizer: Tokenizer for the reward model.
-        prompts: List of prompt strings.
-        responses: List of response strings.
-        max_length: Maximum sequence length.
-
-    Returns:
-        Array of scalar reward scores.
-    """
-    device = next(reward_model.parameters()).device
-    scores = []
-
-    for prompt, response in zip(prompts, responses):
-        text = prompt + response
-        inputs = tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=max_length, padding=True
-        )
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
-
-        with torch.no_grad():
-            outputs = reward_model(input_ids=input_ids, attention_mask=attention_mask)
-            score = outputs.logits.squeeze().cpu().item()
-
-        scores.append(score)
-
-    return np.array(scores)
-
-
 def evaluate_ppo(config_path: str) -> None:
-    """Run PPO evaluation: compare SFT vs PPO reward scores.
+    """Run PPO evaluation: check KL and reward improvement gates.
 
     Args:
         config_path: Path to params.yaml.
-
-    Raises:
-        SystemExit: With code 1 if gate checks fail.
     """
     with open(config_path) as f:
         params = yaml.safe_load(f)
@@ -133,14 +85,9 @@ def evaluate_ppo(config_path: str) -> None:
     global_cfg = params.get("global", {})
     ppo_cfg = params.get("ppo", {})
     eval_gate = ppo_cfg.get("eval_gate", {})
-    sft_cfg = params.get("sft", {})
-    rm_cfg = params.get("reward_model", {})
 
     seed = global_cfg.get("seed", 42)
-    base_model = global_cfg.get("base_model", "meta-llama/Llama-3.2-1B")
     ppo_dir = ppo_cfg.get("output_dir", "models/ppo_policy")
-    sft_dir = sft_cfg.get("output_dir", "models/sft_adapter")
-    rm_dir = rm_cfg.get("output_dir", "models/reward_model")
     max_kl = eval_gate.get("max_kl", 0.15)
     min_reward_improvement = eval_gate.get("min_reward_improvement", 0.1)
     experiment_name = ppo_cfg.get("experiment_name", "rlhf-ppo")
@@ -148,7 +95,7 @@ def evaluate_ppo(config_path: str) -> None:
 
     set_seed(seed)
 
-    # Load PPO training metrics to check KL
+    # Load PPO training metrics
     ppo_metrics_path = Path("reports") / "ppo_metrics.json"
     if ppo_metrics_path.exists():
         with open(ppo_metrics_path) as f:
@@ -162,21 +109,16 @@ def evaluate_ppo(config_path: str) -> None:
     logger.info("PPO final KL: %.6f (max: %.4f)", final_kl, max_kl)
     logger.info("Reward improvement: %.4f (min: %.4f)", reward_improvement, min_reward_improvement)
 
-    # Optionally load models and score a test set
-    # (skipped if we already have training metrics)
-
-    # Setup MLflow
+    # Log to MLflow
     mlflow.set_tracking_uri(mlflow_uri)
     mlflow.set_experiment(experiment_name)
     with mlflow.start_run(run_name="ppo-evaluation"):
         mlflow.log_metric("final_kl", final_kl)
         mlflow.log_metric("reward_improvement", reward_improvement)
         mlflow.log_metric("kl_gate_passed", int(final_kl <= max_kl))
-        mlflow.log_metric(
-            "reward_gate_passed", int(reward_improvement >= min_reward_improvement)
-        )
+        mlflow.log_metric("reward_gate_passed", int(reward_improvement >= min_reward_improvement))
 
-    # Save evaluation metrics
+    # Save metrics
     reports_dir = Path("reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
     eval_metrics = {
@@ -193,44 +135,26 @@ def evaluate_ppo(config_path: str) -> None:
         json.dump(eval_metrics, f, indent=2)
     logger.info("PPO evaluation metrics saved to %s", metrics_path)
 
-    # Gate checks
     gate_passed = True
-
     if final_kl > max_kl:
-        logger.error(
-            "GATE CHECK FAILED: KL %.6f > threshold %.4f", final_kl, max_kl
-        )
+        logger.error("GATE CHECK FAILED: KL %.6f > threshold %.4f", final_kl, max_kl)
         gate_passed = False
-
     if reward_improvement < min_reward_improvement:
-        logger.error(
-            "GATE CHECK FAILED: Reward improvement %.4f < threshold %.4f",
-            reward_improvement,
-            min_reward_improvement,
-        )
+        logger.error("GATE CHECK FAILED: Reward improvement %.4f < threshold %.4f", reward_improvement, min_reward_improvement)
         gate_passed = False
-
     if not gate_passed:
         sys.exit(1)
-
     logger.info("GATE CHECK PASSED: All PPO evaluation metrics meet thresholds")
 
 
 def main() -> None:
     """CLI entry point for PPO evaluation."""
     parser = argparse.ArgumentParser(description="Stage 3: PPO Evaluation Gate")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="params.yaml",
-        help="Path to params.yaml config file",
-    )
+    parser.add_argument("--config", type=str, default="params.yaml")
     args = parser.parse_args()
-
     if not Path(args.config).exists():
         logger.error("Config file not found: %s", args.config)
         sys.exit(1)
-
     evaluate_ppo(args.config)
 
 

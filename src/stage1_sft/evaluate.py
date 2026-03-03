@@ -1,7 +1,9 @@
-"""Stage 1 SFT — Evaluation script with perplexity gate check.
+"""Stage 1 SFT -- Evaluation script with perplexity gate check.
 
-Computes validation perplexity on the held-out split, logs to MLflow,
-and enforces the perplexity gate defined in params.yaml.
+Computes validation perplexity, logs to MLflow, and enforces the gate.
+
+Hardware target: 4x Tesla K80 (fp32).
+Compatible with: transformers==4.38.2, peft==0.7.1
 
 Usage:
     python -m src.stage1_sft.evaluate --config params.yaml
@@ -18,9 +20,8 @@ from pathlib import Path
 import mlflow
 import torch
 import yaml
-from datasets import DatasetDict
-from peft import AutoPeftModelForCausalLM
-from transformers import AutoTokenizer, set_seed
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from src.stage1_sft.dataset import load_sft_dataset
 
@@ -41,10 +42,10 @@ def compute_perplexity(
     """Compute perplexity on a list of text sequences.
 
     Args:
-        model: The language model (PEFT or base).
-        tokenizer: The tokenizer for the model.
-        texts: List of text strings to evaluate.
-        max_length: Maximum sequence length for tokenization.
+        model: The language model.
+        tokenizer: The tokenizer.
+        texts: List of text strings.
+        max_length: Maximum sequence length.
         batch_size: Evaluation batch size.
 
     Returns:
@@ -74,7 +75,6 @@ def compute_perplexity(
                 labels=input_ids,
             )
 
-        # Only count non-padding tokens
         num_tokens = attention_mask.sum().item()
         total_loss += outputs.loss.item() * num_tokens
         total_tokens += num_tokens
@@ -89,9 +89,6 @@ def evaluate_sft(config_path: str) -> None:
 
     Args:
         config_path: Path to params.yaml.
-
-    Raises:
-        SystemExit: With code 1 if perplexity exceeds the gate threshold.
     """
     with open(config_path) as f:
         params = yaml.safe_load(f)
@@ -101,7 +98,7 @@ def evaluate_sft(config_path: str) -> None:
     eval_gate = sft_cfg.get("eval_gate", {})
 
     seed = global_cfg.get("seed", 42)
-    base_model = global_cfg.get("base_model", "meta-llama/Llama-3.2-1B")
+    base_model = global_cfg.get("base_model", "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
     max_seq_length = global_cfg.get("max_seq_length", 512)
     adapter_dir = sft_cfg.get("output_dir", "models/sft_adapter")
     max_perplexity = eval_gate.get("max_perplexity", 15.0)
@@ -111,34 +108,36 @@ def evaluate_sft(config_path: str) -> None:
 
     set_seed(seed)
 
-    # Load validation dataset
+    # Load validation dataset from local disk
     logger.info("Loading validation dataset...")
     dataset = load_sft_dataset(
-        dataset_name=sft_cfg.get("dataset", "tatsu-lab/alpaca"),
+        config=params,
         val_split_ratio=val_split_ratio,
         seed=seed,
     )
     val_texts = dataset["validation"]["text"]
 
-    # Load the fine-tuned model (LoRA adapter)
-    logger.info("Loading SFT adapter from %s", adapter_dir)
+    # Load the fine-tuned model (LoRA adapter, fp32)
+    logger.info("Loading SFT adapter from %s (fp32)", adapter_dir)
     tokenizer = AutoTokenizer.from_pretrained(adapter_dir, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoPeftModelForCausalLM.from_pretrained(
-        adapter_dir,
+    # Load base model + adapter in fp32
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
     )
+    model = PeftModel.from_pretrained(base, adapter_dir)
 
     # Compute perplexity
-    logger.info("Computing validation perplexity on %d samples...", len(val_texts))
+    logger.info("Computing validation perplexity on %d samples...", min(len(val_texts), 500))
     perplexity = compute_perplexity(
         model=model,
         tokenizer=tokenizer,
-        texts=val_texts[:500],  # Cap for speed in CI
+        texts=val_texts[:500],
         max_length=max_seq_length,
     )
     logger.info("Validation perplexity: %.4f (threshold: %.4f)", perplexity, max_perplexity)
@@ -167,35 +166,20 @@ def evaluate_sft(config_path: str) -> None:
 
     # Gate check
     if perplexity > max_perplexity:
-        logger.error(
-            "GATE CHECK FAILED: Perplexity %.4f > threshold %.4f",
-            perplexity,
-            max_perplexity,
-        )
+        logger.error("GATE CHECK FAILED: Perplexity %.4f > threshold %.4f", perplexity, max_perplexity)
         sys.exit(1)
     else:
-        logger.info(
-            "GATE CHECK PASSED: Perplexity %.4f <= threshold %.4f",
-            perplexity,
-            max_perplexity,
-        )
+        logger.info("GATE CHECK PASSED: Perplexity %.4f <= threshold %.4f", perplexity, max_perplexity)
 
 
 def main() -> None:
     """CLI entry point for SFT evaluation."""
     parser = argparse.ArgumentParser(description="Stage 1: SFT Evaluation Gate")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="params.yaml",
-        help="Path to params.yaml config file",
-    )
+    parser.add_argument("--config", type=str, default="params.yaml")
     args = parser.parse_args()
-
     if not Path(args.config).exists():
         logger.error("Config file not found: %s", args.config)
         sys.exit(1)
-
     evaluate_sft(args.config)
 
 

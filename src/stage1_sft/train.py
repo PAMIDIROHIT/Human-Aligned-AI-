@@ -1,11 +1,14 @@
-"""Stage 1 SFT — Training script with QLoRA and SFTTrainer.
+"""Stage 1 SFT -- Training script with LoRA (fp32) and SFTTrainer.
 
-Loads the base model in 4-bit NF4 quantization, applies QLoRA adapters,
-and fine-tunes on the Alpaca instruction dataset using TRL's SFTTrainer.
+Loads TinyLlama-1.1B in fp32 (no quantization), applies LoRA adapters,
+and fine-tunes on UltraChat-200k + Guanaco using TRL's SFTTrainer.
 All hyperparameters are read from params.yaml.
 
+Hardware target: 4x Tesla K80 (11 GB each, CC 3.7, fp32 only)
+Compatible with: transformers==4.38.2, trl==0.7.11, peft==0.7.1
+
 Usage:
-    python -m src.stage1_sft.train --config params.yaml
+    accelerate launch -m src.stage1_sft.train --config params.yaml
 """
 
 from __future__ import annotations
@@ -18,16 +21,16 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import mlflow
 import torch
 import yaml
-from datasets import DatasetDict
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
+    TrainerCallback,
     TrainingArguments,
     set_seed,
 )
@@ -44,83 +47,45 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SFTConfig:
-    """Configuration for SFT training, parsed from params.yaml.
+    """Configuration for SFT training, parsed from params.yaml."""
 
-    Attributes:
-        base_model: HuggingFace model identifier.
-        seed: Random seed for reproducibility.
-        max_seq_length: Maximum sequence length for tokenization.
-        dataset_name: HuggingFace dataset identifier.
-        output_dir: Directory to save the LoRA adapter.
-        experiment_name: MLflow experiment name.
-        mlflow_tracking_uri: MLflow tracking server URI.
-        lora_r: LoRA rank.
-        lora_alpha: LoRA alpha scaling factor.
-        target_modules: List of module names to apply LoRA.
-        lora_dropout: Dropout probability for LoRA layers.
-        lora_bias: Bias type for LoRA.
-        load_in_4bit: Whether to load in 4-bit quantization.
-        bnb_4bit_quant_type: Quantization type (nf4 or fp4).
-        bnb_4bit_compute_dtype: Compute dtype for 4-bit models.
-        bnb_4bit_use_double_quant: Whether to use double quantization.
-        per_device_train_batch_size: Batch size per device.
-        gradient_accumulation_steps: Number of gradient accumulation steps.
-        warmup_ratio: Warmup ratio for learning rate scheduler.
-        num_train_epochs: Number of training epochs.
-        learning_rate: Peak learning rate.
-        fp16: Whether to use fp16 mixed precision.
-        packing: Whether to pack multiple sequences.
-        logging_steps: Log every N steps.
-        save_strategy: When to save checkpoints.
-        evaluation_strategy: When to run evaluation.
-        optim: Optimizer name.
-        weight_decay: Weight decay coefficient.
-        max_grad_norm: Maximum gradient norm for clipping.
-        lr_scheduler_type: Learning rate scheduler type.
-        val_split_ratio: Validation split ratio.
-        max_perplexity: Maximum allowed validation perplexity (gate check).
-    """
-
-    base_model: str = "meta-llama/Llama-3.2-1B"
+    base_model: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
     seed: int = 42
     max_seq_length: int = 512
-    dataset_name: str = "tatsu-lab/alpaca"
     output_dir: str = "models/sft_adapter"
     experiment_name: str = "rlhf-sft"
     mlflow_tracking_uri: str = "http://localhost:5000"
 
-    # QLoRA
+    # LoRA (no quantization)
     lora_r: int = 64
     lora_alpha: int = 16
     target_modules: list[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
     lora_dropout: float = 0.05
     lora_bias: str = "none"
 
-    # Quantization
-    load_in_4bit: bool = True
-    bnb_4bit_quant_type: str = "nf4"
-    bnb_4bit_compute_dtype: str = "float16"
-    bnb_4bit_use_double_quant: bool = True
-
-    # Training
-    per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 4
+    # Training (fp32, K80-sized batches)
+    per_device_train_batch_size: int = 2
+    gradient_accumulation_steps: int = 8
     warmup_ratio: float = 0.03
     num_train_epochs: int = 3
     learning_rate: float = 2e-4
-    fp16: bool = True
+    fp16: bool = False
     packing: bool = True
     logging_steps: int = 10
     save_strategy: str = "epoch"
     evaluation_strategy: str = "epoch"
-    optim: str = "paged_adamw_32bit"
+    optim: str = "adamw_torch"
     weight_decay: float = 0.001
     max_grad_norm: float = 0.3
     lr_scheduler_type: str = "cosine"
+    gradient_checkpointing: bool = True
 
     # Eval gate
     val_split_ratio: float = 0.1
     max_perplexity: float = 15.0
+
+    # Full config dict (for dataset loader)
+    _raw_config: dict = field(default_factory=dict)
 
 
 def load_config(config_path: str) -> SFTConfig:
@@ -131,17 +96,13 @@ def load_config(config_path: str) -> SFTConfig:
 
     Returns:
         An SFTConfig dataclass populated with values from the YAML file.
-
-    Raises:
-        FileNotFoundError: If config_path does not exist.
     """
     with open(config_path) as f:
         params = yaml.safe_load(f)
 
     g = params.get("global", {})
     s = params.get("sft", {})
-    q = s.get("qlora", {})
-    quant = s.get("quantization", {})
+    lora = s.get("lora", s.get("qlora", {}))
     t = s.get("training", {})
     e = s.get("eval_gate", {})
 
@@ -149,19 +110,14 @@ def load_config(config_path: str) -> SFTConfig:
         base_model=g.get("base_model", SFTConfig.base_model),
         seed=g.get("seed", SFTConfig.seed),
         max_seq_length=g.get("max_seq_length", SFTConfig.max_seq_length),
-        dataset_name=s.get("dataset", SFTConfig.dataset_name),
         output_dir=s.get("output_dir", SFTConfig.output_dir),
         experiment_name=s.get("experiment_name", SFTConfig.experiment_name),
         mlflow_tracking_uri=g.get("mlflow_tracking_uri", SFTConfig.mlflow_tracking_uri),
-        lora_r=q.get("r", SFTConfig.lora_r),
-        lora_alpha=q.get("lora_alpha", SFTConfig.lora_alpha),
-        target_modules=q.get("target_modules", SFTConfig.target_modules),
-        lora_dropout=q.get("lora_dropout", SFTConfig.lora_dropout),
-        lora_bias=q.get("bias", SFTConfig.lora_bias),
-        load_in_4bit=quant.get("load_in_4bit", SFTConfig.load_in_4bit),
-        bnb_4bit_quant_type=quant.get("bnb_4bit_quant_type", SFTConfig.bnb_4bit_quant_type),
-        bnb_4bit_compute_dtype=quant.get("bnb_4bit_compute_dtype", SFTConfig.bnb_4bit_compute_dtype),
-        bnb_4bit_use_double_quant=quant.get("bnb_4bit_use_double_quant", SFTConfig.bnb_4bit_use_double_quant),
+        lora_r=lora.get("r", SFTConfig.lora_r),
+        lora_alpha=lora.get("lora_alpha", SFTConfig.lora_alpha),
+        target_modules=lora.get("target_modules", SFTConfig.target_modules),
+        lora_dropout=lora.get("lora_dropout", SFTConfig.lora_dropout),
+        lora_bias=lora.get("bias", SFTConfig.lora_bias),
         per_device_train_batch_size=t.get("per_device_train_batch_size", SFTConfig.per_device_train_batch_size),
         gradient_accumulation_steps=t.get("gradient_accumulation_steps", SFTConfig.gradient_accumulation_steps),
         warmup_ratio=t.get("warmup_ratio", SFTConfig.warmup_ratio),
@@ -176,31 +132,15 @@ def load_config(config_path: str) -> SFTConfig:
         weight_decay=t.get("weight_decay", SFTConfig.weight_decay),
         max_grad_norm=t.get("max_grad_norm", SFTConfig.max_grad_norm),
         lr_scheduler_type=t.get("lr_scheduler_type", SFTConfig.lr_scheduler_type),
+        gradient_checkpointing=t.get("gradient_checkpointing", SFTConfig.gradient_checkpointing),
         val_split_ratio=e.get("val_split_ratio", SFTConfig.val_split_ratio),
         max_perplexity=e.get("max_perplexity", SFTConfig.max_perplexity),
-    )
-
-
-def create_bnb_config(cfg: SFTConfig) -> BitsAndBytesConfig:
-    """Create BitsAndBytes quantization config for 4-bit NF4 loading.
-
-    Args:
-        cfg: SFT configuration dataclass.
-
-    Returns:
-        A BitsAndBytesConfig for 4-bit quantization.
-    """
-    compute_dtype = getattr(torch, cfg.bnb_4bit_compute_dtype, torch.float16)
-    return BitsAndBytesConfig(
-        load_in_4bit=cfg.load_in_4bit,
-        bnb_4bit_quant_type=cfg.bnb_4bit_quant_type,
-        bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=cfg.bnb_4bit_use_double_quant,
+        _raw_config=params,
     )
 
 
 def create_lora_config(cfg: SFTConfig) -> LoraConfig:
-    """Create PEFT LoRA configuration for QLoRA fine-tuning.
+    """Create PEFT LoRA configuration.
 
     Args:
         cfg: SFT configuration dataclass.
@@ -225,7 +165,7 @@ def create_training_args(cfg: SFTConfig) -> TrainingArguments:
         cfg: SFT configuration dataclass.
 
     Returns:
-        A TrainingArguments object for the Trainer.
+        A TrainingArguments object.
     """
     return TrainingArguments(
         output_dir=cfg.output_dir,
@@ -243,34 +183,23 @@ def create_training_args(cfg: SFTConfig) -> TrainingArguments:
         max_grad_norm=cfg.max_grad_norm,
         lr_scheduler_type=cfg.lr_scheduler_type,
         seed=cfg.seed,
-        report_to="none",  # We use MLflow manually
+        report_to="none",
         remove_unused_columns=False,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
+        gradient_checkpointing=cfg.gradient_checkpointing,
+        ddp_find_unused_parameters=False,
     )
 
 
-class MLflowLoggingCallback:
-    """Custom callback to log training metrics to MLflow.
-
-    Logs loss at each logging step and perplexity at each evaluation step.
-    """
+class MLflowLoggingCallback(TrainerCallback):
+    """Custom callback to log training metrics to MLflow."""
 
     def __init__(self) -> None:
-        """Initialize the callback."""
         self._loss_records: list[dict[str, float]] = []
 
-    def on_log(self, args: TrainingArguments, state: Any, control: Any, logs: dict | None = None, **kwargs: Any) -> None:
-        """Log metrics on each logging step.
-
-        Args:
-            args: Training arguments.
-            state: Current trainer state.
-            control: Trainer control object.
-            logs: Dictionary of logged metrics.
-            **kwargs: Additional keyword arguments.
-        """
+    def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
             return
         step = state.global_step
@@ -284,31 +213,21 @@ class MLflowLoggingCallback:
 
     @property
     def loss_records(self) -> list[dict[str, float]]:
-        """Get recorded loss values for CSV export.
-
-        Returns:
-            List of dicts with 'step' and 'loss' keys.
-        """
         return self._loss_records
 
 
 def train_sft(cfg: SFTConfig) -> None:
     """Execute the full SFT training pipeline.
 
-    Loads the base model with 4-bit quantization, applies QLoRA adapters,
-    trains on the Alpaca dataset using SFTTrainer, and logs everything to MLflow.
+    Loads TinyLlama in fp32, applies LoRA adapters, trains on
+    UltraChat + Guanaco, and logs everything to MLflow.
 
     Args:
         cfg: SFT configuration dataclass.
-
-    Raises:
-        RuntimeError: If CUDA is not available.
     """
-    # Set seeds
     set_seed(cfg.seed)
     logger.info("Random seed set to %d", cfg.seed)
 
-    # Check CUDA
     if not torch.cuda.is_available():
         logger.warning("CUDA not available. Training will be slow on CPU.")
 
@@ -316,10 +235,9 @@ def train_sft(cfg: SFTConfig) -> None:
     mlflow.set_tracking_uri(cfg.mlflow_tracking_uri)
     mlflow.set_experiment(cfg.experiment_name)
 
-    with mlflow.start_run(run_name="sft-qlora-training") as run:
+    with mlflow.start_run(run_name="sft-lora-training") as run:
         logger.info("MLflow run ID: %s", run.info.run_id)
 
-        # Log all config params
         mlflow.log_params({
             "base_model": cfg.base_model,
             "seed": cfg.seed,
@@ -332,14 +250,15 @@ def train_sft(cfg: SFTConfig) -> None:
             "num_train_epochs": cfg.num_train_epochs,
             "per_device_train_batch_size": cfg.per_device_train_batch_size,
             "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
-            "bnb_4bit_quant_type": cfg.bnb_4bit_quant_type,
             "packing": cfg.packing,
+            "precision": "fp32",
+            "hardware": "4xK80",
         })
 
-        # Load dataset
-        logger.info("Loading dataset: %s", cfg.dataset_name)
+        # Load dataset from local disk
+        logger.info("Loading SFT dataset from local disk...")
         dataset = load_sft_dataset(
-            dataset_name=cfg.dataset_name,
+            config=cfg._raw_config,
             val_split_ratio=cfg.val_split_ratio,
             seed=cfg.seed,
         )
@@ -356,23 +275,23 @@ def train_sft(cfg: SFTConfig) -> None:
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # Load model with 4-bit quantization
-        logger.info("Loading model with 4-bit NF4 quantization: %s", cfg.base_model)
-        bnb_config = create_bnb_config(cfg)
+        # Load model in fp32 (no quantization for K80)
+        logger.info("Loading model in fp32 (no quantization): %s", cfg.base_model)
         model = AutoModelForCausalLM.from_pretrained(
             cfg.base_model,
-            quantization_config=bnb_config,
+            torch_dtype=torch.float32,
             device_map="auto",
             trust_remote_code=True,
         )
         model.config.use_cache = False
-        model.config.pretraining_tp = 1
 
-        # Prepare model for k-bit training
-        model = prepare_model_for_kbit_training(model)
+        # Enable gradient checkpointing to save memory
+        if cfg.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
 
         # Apply LoRA
-        logger.info("Applying QLoRA adapters (r=%d, alpha=%d)", cfg.lora_r, cfg.lora_alpha)
+        logger.info("Applying LoRA adapters (r=%d, alpha=%d)", cfg.lora_r, cfg.lora_alpha)
         lora_config = create_lora_config(cfg)
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
@@ -389,7 +308,7 @@ def train_sft(cfg: SFTConfig) -> None:
         # MLflow callback
         mlflow_callback = MLflowLoggingCallback()
 
-        # Create SFTTrainer
+        # Create SFTTrainer (TRL 0.7.11 API)
         logger.info("Initializing SFTTrainer with packing=%s", cfg.packing)
         trainer = SFTTrainer(
             model=model,
@@ -404,7 +323,7 @@ def train_sft(cfg: SFTConfig) -> None:
         )
 
         # Train
-        logger.info("Starting SFT training...")
+        logger.info("Starting SFT training (fp32, LoRA, K80)...")
         train_result = trainer.train()
 
         # Log final metrics
@@ -462,12 +381,8 @@ def train_sft(cfg: SFTConfig) -> None:
 
 
 def main() -> None:
-    """CLI entry point for SFT training.
-
-    Raises:
-        SystemExit: If config file is not found.
-    """
-    parser = argparse.ArgumentParser(description="Stage 1: SFT with QLoRA")
+    """CLI entry point for SFT training."""
+    parser = argparse.ArgumentParser(description="Stage 1: SFT with LoRA (fp32, K80)")
     parser.add_argument(
         "--config",
         type=str,

@@ -2,22 +2,35 @@
 # RLHF Pipeline — Centralized Hyperparameters
 # All training scripts read from this file via yaml.safe_load
 # ============================================================
+# TARGET HARDWARE: 4× Tesla K80 (11 GB each, CC 3.7)
+# PyTorch 1.12.1+cu113  |  transformers 4.38.2  |  TRL 0.7.11
+# Training mode: fp32 (no quantization, no fp16 — K80 lacks tensor cores)
+# ============================================================
 
 # ---- Global ----
 global:
   seed: 42
-  base_model: "meta-llama/Llama-3.2-1B"
+  base_model: "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
   max_seq_length: 512
   mlflow_tracking_uri: "http://localhost:5000"
 
-# ---- Stage 1: Supervised Fine-Tuning (QLoRA) ----
+# ---- Local Dataset Paths ----
+data:
+  sft_primary: "data/sft/ultrachat_200k"
+  sft_supplement: "data/sft/openassistant_guanaco"
+  reward_primary: "data/reward/anthropic_hh_rlhf"
+  reward_supplement: "data/reward/ultrafeedback_binarized"
+  ppo_primary: "data/ppo/ultrafeedback_binarized_gen"
+  ppo_safety: "data/ppo/pku_saferlhf"
+
+# ---- Stage 1: Supervised Fine-Tuning (LoRA, fp32) ----
 sft:
-  dataset: "tatsu-lab/alpaca"
+  dataset: "local"  # loads from data.sft_primary + data.sft_supplement
   output_dir: "models/sft_adapter"
   experiment_name: "rlhf-sft"
 
-  # QLoRA config
-  qlora:
+  # LoRA config (no quantization — pure LoRA on fp32 base)
+  lora:
     r: 64
     lora_alpha: 16
     target_modules: ["q_proj", "v_proj"]
@@ -25,29 +38,24 @@ sft:
     bias: "none"
     task_type: "CAUSAL_LM"
 
-  # BitsAndBytes quantization
-  quantization:
-    load_in_4bit: true
-    bnb_4bit_quant_type: "nf4"
-    bnb_4bit_compute_dtype: "float16"
-    bnb_4bit_use_double_quant: true
-
-  # Training arguments
+  # Training arguments (fp32, K80 batch sizes)
   training:
-    per_device_train_batch_size: 4
-    gradient_accumulation_steps: 4
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 8
     warmup_ratio: 0.03
     num_train_epochs: 3
     learning_rate: 2.0e-4
-    fp16: true
+    fp16: false
     logging_steps: 10
     save_strategy: "epoch"
     evaluation_strategy: "epoch"
     packing: true
-    optim: "paged_adamw_32bit"
+    optim: "adamw_torch"
     weight_decay: 0.001
     max_grad_norm: 0.3
     lr_scheduler_type: "cosine"
+    gradient_checkpointing: true
+    dataloader_num_workers: 2
 
   # Evaluation gate
   eval_gate:
@@ -56,7 +64,7 @@ sft:
 
 # ---- Stage 2: Reward Model (Bradley-Terry) ----
 reward_model:
-  dataset: "Anthropic/hh-rlhf"
+  dataset: "local"  # loads from data.reward_primary + data.reward_supplement
   output_dir: "models/reward_model"
   experiment_name: "rlhf-reward-model"
 
@@ -65,14 +73,14 @@ reward_model:
     freeze_layers_except_last_n: 2
     reward_head_hidden_size: null  # auto from model config
 
-  # Training arguments
+  # Training arguments (fp32, K80 batch sizes)
   training:
-    per_device_train_batch_size: 8
-    gradient_accumulation_steps: 1
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 2
     num_train_epochs: 1
     learning_rate: 1.0e-5
     warmup_steps: 100
-    fp16: true
+    fp16: false
     logging_steps: 10
     save_strategy: "epoch"
     evaluation_strategy: "steps"
@@ -82,6 +90,7 @@ reward_model:
     max_grad_norm: 1.0
     lr_scheduler_type: "linear"
     max_length: 512
+    gradient_checkpointing: true
 
   # Evaluation gate
   eval_gate:
@@ -90,16 +99,16 @@ reward_model:
 
 # ---- Stage 3: PPO Policy Optimization ----
 ppo:
-  dataset: "Anthropic/hh-rlhf"
+  dataset: "local"  # loads from data.ppo_primary + data.ppo_safety
   output_dir: "models/ppo_policy"
   experiment_name: "rlhf-ppo"
 
-  # PPO config
+  # PPO config (reduced batch sizes for 4× K80)
   config:
     learning_rate: 1.41e-5
-    batch_size: 128
-    mini_batch_size: 32
-    gradient_accumulation_steps: 1
+    batch_size: 16
+    mini_batch_size: 4
+    gradient_accumulation_steps: 2
     optimize_cuda_cache: true
     early_stopping: true
     target_kl: 0.1
@@ -114,7 +123,7 @@ ppo:
 
   # Generation config
   generation:
-    max_new_tokens: 200
+    max_new_tokens: 128
     temperature: 0.7
     top_k: 0
     top_p: 1.0
@@ -161,8 +170,9 @@ evaluation:
     - stem
     - humanities
 
-# ---- Prometheus Metrics ----
+# ---- Prometheus Metrics (remote scraping from laptop) ----
 monitoring:
-  prometheus_port: 9090
-  grafana_port: 3000
-  metrics_push_gateway: "http://localhost:9091"
+  # Metrics HTTP endpoint on GPU server (exposed for laptop to scrape)
+  metrics_port: 9091
+  # Prometheus runs on your laptop, NOT on this GPU server
+  # Configure laptop prometheus.yml to scrape <gpu_server_ip>:9091

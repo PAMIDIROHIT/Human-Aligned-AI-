@@ -1,7 +1,9 @@
-"""Stage 2 Reward Model — Evaluation script with accuracy gate check.
+"""Stage 2 Reward Model -- Evaluation script with accuracy gate check.
 
-Computes RM accuracy on the test split of HH-RLHF, logs to MLflow,
-and enforces the accuracy gate defined in params.yaml.
+Computes RM accuracy on test split, logs to MLflow, enforces gate.
+
+Hardware target: 4x Tesla K80 (fp32).
+Compatible with: transformers==4.38.2
 
 Usage:
     python -m src.stage2_reward.evaluate --config params.yaml
@@ -40,14 +42,14 @@ def compute_reward_scores(
     """Compute scalar reward scores for a list of texts.
 
     Args:
-        model: The reward model (AutoModelForSequenceClassification).
-        tokenizer: The tokenizer for the model.
-        texts: List of text strings to score.
-        max_length: Maximum sequence length for tokenization.
+        model: The reward model.
+        tokenizer: The tokenizer.
+        texts: List of text strings.
+        max_length: Maximum sequence length.
         batch_size: Inference batch size.
 
     Returns:
-        A numpy array of reward scores with shape (len(texts),).
+        Array of reward scores.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -67,7 +69,6 @@ def compute_reward_scores(
 
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            # outputs.logits has shape (batch_size, 1)
             scores = outputs.logits.squeeze(-1).cpu().numpy()
             all_scores.extend(scores.tolist() if scores.ndim > 0 else [scores.item()])
 
@@ -79,9 +80,6 @@ def evaluate_reward_model(config_path: str) -> None:
 
     Args:
         config_path: Path to params.yaml.
-
-    Raises:
-        SystemExit: With code 1 if accuracy is below the gate threshold.
     """
     with open(config_path) as f:
         params = yaml.safe_load(f)
@@ -100,44 +98,34 @@ def evaluate_reward_model(config_path: str) -> None:
 
     set_seed(seed)
 
-    # Load test dataset
+    # Load test dataset from local disk
     logger.info("Loading test dataset...")
-    dataset = load_reward_dataset(
-        dataset_name=rm_cfg.get("dataset", "Anthropic/hh-rlhf"),
-        seed=seed,
-    )
+    dataset = load_reward_dataset(config=params, seed=seed)
     test_data = dataset["test"]
 
-    # Cap for speed in evaluation
     eval_samples = min(1000, len(test_data))
     test_data = test_data.select(range(eval_samples))
 
-    # Load reward model
-    logger.info("Loading reward model from %s", model_dir)
+    # Load reward model (fp32)
+    logger.info("Loading reward model from %s (fp32)", model_dir)
     tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_dir,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         device_map="auto",
         trust_remote_code=True,
     )
 
-    # Score chosen and rejected
     chosen_texts = test_data["chosen"]
     rejected_texts = test_data["rejected"]
 
     logger.info("Computing reward scores for %d pairs...", eval_samples)
-    chosen_scores = compute_reward_scores(
-        model, tokenizer, chosen_texts, max_length=max_length
-    )
-    rejected_scores = compute_reward_scores(
-        model, tokenizer, rejected_texts, max_length=max_length
-    )
+    chosen_scores = compute_reward_scores(model, tokenizer, chosen_texts, max_length=max_length)
+    rejected_scores = compute_reward_scores(model, tokenizer, rejected_texts, max_length=max_length)
 
-    # Compute metrics
     margins = chosen_scores - rejected_scores
     accuracy = float(np.mean(chosen_scores > rejected_scores))
     mean_margin = float(np.mean(margins))
@@ -145,11 +133,7 @@ def evaluate_reward_model(config_path: str) -> None:
 
     logger.info("RM accuracy: %.4f (threshold: %.4f)", accuracy, min_accuracy)
     logger.info("Mean reward margin: %.4f", mean_margin)
-    logger.info(
-        "Positive margin ratio: %.4f (threshold: %.4f)",
-        positive_margin_ratio,
-        min_margin_ratio,
-    )
+    logger.info("Positive margin ratio: %.4f (threshold: %.4f)", positive_margin_ratio, min_margin_ratio)
 
     # Log to MLflow
     mlflow.set_tracking_uri(mlflow_uri)
@@ -158,29 +142,16 @@ def evaluate_reward_model(config_path: str) -> None:
         mlflow.log_metric("rm_test_accuracy", accuracy)
         mlflow.log_metric("rm_test_mean_margin", mean_margin)
         mlflow.log_metric("rm_test_positive_margin_ratio", positive_margin_ratio)
-        mlflow.log_metric("rm_test_chosen_mean", float(np.mean(chosen_scores)))
-        mlflow.log_metric("rm_test_rejected_mean", float(np.mean(rejected_scores)))
         mlflow.log_metric("gate_passed", int(accuracy >= min_accuracy))
 
-        # Log reward distribution histogram data
-        mlflow.log_metric("rm_chosen_std", float(np.std(chosen_scores)))
-        mlflow.log_metric("rm_rejected_std", float(np.std(rejected_scores)))
-        mlflow.log_metric("rm_margin_std", float(np.std(margins)))
-
-    # Save evaluation metrics
+    # Save metrics
     reports_dir = Path("reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
     eval_metrics = {
         "test_accuracy": accuracy,
         "mean_reward_margin": mean_margin,
         "positive_margin_ratio": positive_margin_ratio,
-        "chosen_mean_reward": float(np.mean(chosen_scores)),
-        "rejected_mean_reward": float(np.mean(rejected_scores)),
-        "chosen_std": float(np.std(chosen_scores)),
-        "rejected_std": float(np.std(rejected_scores)),
-        "margin_std": float(np.std(margins)),
         "min_accuracy_threshold": min_accuracy,
-        "min_margin_ratio_threshold": min_margin_ratio,
         "gate_passed": accuracy >= min_accuracy and positive_margin_ratio >= min_margin_ratio,
         "num_eval_pairs": eval_samples,
     }
@@ -189,41 +160,23 @@ def evaluate_reward_model(config_path: str) -> None:
         json.dump(eval_metrics, f, indent=2)
     logger.info("Evaluation metrics saved to %s", metrics_path)
 
-    # Gate check
     if accuracy < min_accuracy:
-        logger.error(
-            "GATE CHECK FAILED: Accuracy %.4f < threshold %.4f",
-            accuracy,
-            min_accuracy,
-        )
+        logger.error("GATE CHECK FAILED: Accuracy %.4f < threshold %.4f", accuracy, min_accuracy)
         sys.exit(1)
-
     if positive_margin_ratio < min_margin_ratio:
-        logger.error(
-            "GATE CHECK FAILED: Positive margin ratio %.4f < threshold %.4f",
-            positive_margin_ratio,
-            min_margin_ratio,
-        )
+        logger.error("GATE CHECK FAILED: Margin ratio %.4f < threshold %.4f", positive_margin_ratio, min_margin_ratio)
         sys.exit(1)
-
     logger.info("GATE CHECK PASSED: All RM evaluation metrics meet thresholds")
 
 
 def main() -> None:
     """CLI entry point for reward model evaluation."""
     parser = argparse.ArgumentParser(description="Stage 2: RM Evaluation Gate")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="params.yaml",
-        help="Path to params.yaml config file",
-    )
+    parser.add_argument("--config", type=str, default="params.yaml")
     args = parser.parse_args()
-
     if not Path(args.config).exists():
         logger.error("Config file not found: %s", args.config)
         sys.exit(1)
-
     evaluate_reward_model(args.config)
 
 

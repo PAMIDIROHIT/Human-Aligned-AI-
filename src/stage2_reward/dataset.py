@@ -1,49 +1,30 @@
-"""Stage 2 Reward Model — Dataset loader for Anthropic HH-RLHF.
+"""Stage 2 Reward Model — Dataset loader for Anthropic HH-RLHF + UltraFeedback.
 
-Loads chosen/rejected pairs and formats them for RewardTrainer.
-Each example contains a 'chosen' and 'rejected' response to the same prompt.
+Loads locally-downloaded preference datasets from data/reward/,
+formats chosen/rejected pairs for RewardTrainer.
+
+Hardware target: 4x Tesla K80 (fp32, no quantization).
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 
 logger = logging.getLogger(__name__)
 
 
-def extract_prompt_from_conversation(text: str) -> str:
-    """Extract the human prompt from an HH-RLHF conversation string.
-
-    The HH-RLHF dataset uses '\\n\\nHuman:' and '\\n\\nAssistant:' delimiters.
-    This extracts all content up to and including the last Human turn.
-
-    Args:
-        text: Raw conversation string from HH-RLHF.
-
-    Returns:
-        The prompt portion of the conversation (everything before the
-        final Assistant response).
-    """
-    # Find the last occurrence of "\n\nAssistant:"
-    last_assistant_idx = text.rfind("\n\nAssistant:")
-    if last_assistant_idx == -1:
-        return text
-    return text[:last_assistant_idx].strip()
-
-
 def format_hh_rlhf_pair(example: dict[str, Any]) -> dict[str, str]:
-    """Format an HH-RLHF example into chosen/rejected text pairs.
+    """Format an Anthropic HH-RLHF chosen/rejected pair.
 
     Args:
-        example: A dictionary with 'chosen' and 'rejected' keys,
-            each containing a full conversation string.
+        example: Example with 'chosen' and 'rejected' fields.
 
     Returns:
-        A dictionary with 'chosen' and 'rejected' keys containing
-        the formatted conversation strings.
+        Dictionary with 'chosen' and 'rejected' text.
     """
     return {
         "chosen": example["chosen"].strip(),
@@ -51,110 +32,201 @@ def format_hh_rlhf_pair(example: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def format_prompt_only(example: dict[str, Any]) -> dict[str, str]:
-    """Extract prompt-only from an HH-RLHF example (for PPO rollouts).
+def format_ultrafeedback_pair(example: dict[str, Any]) -> dict[str, str]:
+    """Format an UltraFeedback binarized preference pair.
+
+    UltraFeedback has 'chosen' and 'rejected' as lists of message dicts.
 
     Args:
-        example: A dictionary with a 'chosen' key containing the
-            full conversation string.
+        example: Example from ultrafeedback_binarized.
 
     Returns:
-        A dictionary with a 'query' key containing only the prompt.
+        Dictionary with 'chosen' and 'rejected' text.
+    """
+    chosen = example.get("chosen", [])
+    rejected = example.get("rejected", [])
+
+    # Handle list-of-dicts format (messages)
+    if isinstance(chosen, list):
+        chosen_text = "\n".join(
+            m.get("content", str(m)) if isinstance(m, dict) else str(m)
+            for m in chosen
+        )
+    else:
+        chosen_text = str(chosen)
+
+    if isinstance(rejected, list):
+        rejected_text = "\n".join(
+            m.get("content", str(m)) if isinstance(m, dict) else str(m)
+            for m in rejected
+        )
+    else:
+        rejected_text = str(rejected)
+
+    return {
+        "chosen": chosen_text.strip(),
+        "rejected": rejected_text.strip(),
+    }
+
+
+def extract_prompt_from_conversation(text: str) -> str:
+    """Extract the prompt (human turn) from an HH-RLHF conversation.
+
+    Args:
+        text: Full conversation text.
+
+    Returns:
+        The prompt portion up to the last assistant turn.
+    """
+    last_assistant_idx = text.rfind("\n\nAssistant:")
+    if last_assistant_idx == -1:
+        return text
+    return text[:last_assistant_idx].strip()
+
+
+def format_prompt_only(example: dict[str, Any]) -> dict[str, str]:
+    """Extract just the prompt from a preference pair for PPO use.
+
+    Args:
+        example: Example with 'chosen' field.
+
+    Returns:
+        Dictionary with 'query' field.
     """
     prompt = extract_prompt_from_conversation(example["chosen"])
     return {"query": prompt}
 
 
 def load_reward_dataset(
-    dataset_name: str = "Anthropic/hh-rlhf",
-    max_length: int = 512,
+    config: dict | None = None,
     seed: int = 42,
     max_samples: int | None = None,
     test_split_ratio: float = 0.1,
+    dataset_name: str | None = None,
+    max_length: int = 512,
 ) -> DatasetDict:
-    """Load and preprocess the HH-RLHF dataset for reward model training.
+    """Load reward model datasets from local disk.
+
+    Combines Anthropic HH-RLHF + UltraFeedback binarized.
 
     Args:
-        dataset_name: HuggingFace dataset identifier.
-        max_length: Maximum sequence length (used for downstream filtering).
-        seed: Random seed for reproducible splitting.
-        max_samples: Optional cap on total samples (for debugging).
-        test_split_ratio: Fraction of training data for test set if no
-            test split exists in the dataset.
+        config: Full params.yaml config dict (optional).
+        seed: Random seed.
+        max_samples: Maximum samples per split.
+        test_split_ratio: Fraction for test split.
+        dataset_name: Legacy parameter.
+        max_length: Unused, kept for compatibility.
 
     Returns:
-        A DatasetDict with 'train' and 'test' splits, each containing
-        'chosen' and 'rejected' columns.
+        DatasetDict with 'train' and 'test' splits, each with 'chosen'/'rejected'.
     """
-    logger.info("Loading HH-RLHF dataset: %s", dataset_name)
+    datasets_to_combine = []
 
-    dataset = load_dataset(dataset_name)
+    data_cfg = config.get("data", {}) if config else {}
+    primary_path = data_cfg.get("reward_primary", "data/reward/anthropic_hh_rlhf")
+    supplement_path = data_cfg.get("reward_supplement", "data/reward/ultrafeedback_binarized")
 
-    # The HH-RLHF dataset has 'train' and 'test' splits
-    if "test" not in dataset:
-        logger.info("No test split found, creating one from train split")
-        split = dataset["train"].train_test_split(
-            test_size=test_split_ratio, seed=seed
-        )
-        dataset = DatasetDict({"train": split["train"], "test": split["test"]})
-
-    # Format pairs
-    for split_name in dataset:
-        dataset[split_name] = dataset[split_name].map(
+    # Load Anthropic HH-RLHF (primary)
+    primary_dir = Path(primary_path)
+    if primary_dir.exists():
+        logger.info("Loading Anthropic HH-RLHF from local: %s", primary_dir)
+        ds = load_from_disk(str(primary_dir))
+        ds = ds.map(
             format_hh_rlhf_pair,
-            desc=f"Formatting HH-RLHF pairs ({split_name})",
+            desc="Formatting HH-RLHF pairs",
+        )
+        # Keep only chosen/rejected columns
+        keep_cols = {"chosen", "rejected"}
+        remove_cols = [c for c in ds.column_names if c not in keep_cols]
+        if remove_cols:
+            ds = ds.remove_columns(remove_cols)
+        datasets_to_combine.append(ds)
+        logger.info("HH-RLHF: %d pairs loaded", len(ds))
+    else:
+        logger.warning("HH-RLHF not found at %s", primary_dir)
+
+    # Load UltraFeedback binarized (supplement)
+    supplement_dir = Path(supplement_path)
+    if supplement_dir.exists():
+        logger.info("Loading UltraFeedback from local: %s", supplement_dir)
+        ds = load_from_disk(str(supplement_dir))
+        ds = ds.map(
+            format_ultrafeedback_pair,
+            remove_columns=ds.column_names,
+            desc="Formatting UltraFeedback pairs",
+        )
+        datasets_to_combine.append(ds)
+        logger.info("UltraFeedback: %d pairs loaded", len(ds))
+    else:
+        logger.warning("UltraFeedback not found at %s", supplement_dir)
+
+    if not datasets_to_combine:
+        raise FileNotFoundError(
+            f"No reward datasets found at {primary_path} or {supplement_path}. "
+            "Run the dataset download script first."
         )
 
-    # Cap samples if requested
+    combined = concatenate_datasets(datasets_to_combine)
+    combined = combined.shuffle(seed=seed)
+    logger.info("Combined reward dataset: %d pairs", len(combined))
+
     if max_samples is not None:
-        for split_name in dataset:
-            n = min(max_samples, len(dataset[split_name]))
-            dataset[split_name] = dataset[split_name].select(range(n))
-            logger.info("Capped %s to %d samples", split_name, n)
+        combined = combined.select(range(min(max_samples, len(combined))))
+
+    # Train/test split
+    split = combined.train_test_split(test_size=test_split_ratio, seed=seed)
+    dataset_dict = DatasetDict({
+        "train": split["train"],
+        "test": split["test"],
+    })
 
     logger.info(
-        "HH-RLHF loaded — train: %d, test: %d",
-        len(dataset["train"]),
-        len(dataset["test"]),
+        "Reward dataset -- train: %d, test: %d",
+        len(dataset_dict["train"]),
+        len(dataset_dict["test"]),
     )
-    return dataset
+    return dataset_dict
 
 
 def load_prompt_dataset(
-    dataset_name: str = "Anthropic/hh-rlhf",
+    config: dict | None = None,
     split: str = "train",
     seed: int = 42,
     max_samples: int | None = None,
+    dataset_name: str | None = None,
 ) -> Dataset:
-    """Load prompt-only data from HH-RLHF for PPO rollouts.
+    """Load prompts from HH-RLHF for PPO (backward compatibility).
 
     Args:
-        dataset_name: HuggingFace dataset identifier.
-        split: Which split to load ('train' or 'test').
-        seed: Random seed for reproducibility.
-        max_samples: Optional cap on total samples.
+        config: Full params.yaml config dict (optional).
+        split: Unused, loads all data.
+        seed: Random seed.
+        max_samples: Maximum samples.
+        dataset_name: Legacy parameter.
 
     Returns:
-        A Dataset with a 'query' column containing prompt strings.
+        Dataset with 'query' field.
     """
-    logger.info("Loading HH-RLHF prompts for PPO: %s (split=%s)", dataset_name, split)
+    data_cfg = config.get("data", {}) if config else {}
+    primary_path = data_cfg.get("reward_primary", "data/reward/anthropic_hh_rlhf")
 
-    dataset = load_dataset(dataset_name, split=split)
+    primary_dir = Path(primary_path)
+    if not primary_dir.exists():
+        raise FileNotFoundError(f"HH-RLHF not found at {primary_dir}")
 
-    # Extract prompts
-    dataset = dataset.map(
+    ds = load_from_disk(str(primary_dir))
+    ds = ds.map(
         format_prompt_only,
-        remove_columns=dataset.column_names,
+        remove_columns=ds.column_names,
         desc="Extracting prompts",
     )
 
-    # Deduplicate prompts
-    df = dataset.to_pandas()
+    df = ds.to_pandas()
     df = df.drop_duplicates(subset=["query"])
-    dataset = Dataset.from_pandas(df, preserve_index=False)
+    ds = Dataset.from_pandas(df, preserve_index=False)
 
     if max_samples is not None:
-        dataset = dataset.select(range(min(max_samples, len(dataset))))
+        ds = ds.select(range(min(max_samples, len(ds))))
 
-    logger.info("Loaded %d unique prompts for PPO", len(dataset))
-    return dataset
+    logger.info("Loaded %d unique prompts", len(ds))
+    return ds

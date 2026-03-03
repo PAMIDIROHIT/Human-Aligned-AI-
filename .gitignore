@@ -49,3 +49,6 @@ Thumbs.db
 # Secrets
 .env
 *.pem
+
+# Downloaded datasets (too large for git)
+data/

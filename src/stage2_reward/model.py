@@ -1,8 +1,11 @@
-"""Stage 2 Reward Model — Model definition with scalar reward head.
+"""Stage 2 Reward Model -- Model definition with scalar reward head.
 
 Loads the SFT checkpoint (merges LoRA adapters), adds a scalar reward head
 on top of the last hidden state, and freezes all layers except the reward
 head and the last N transformer blocks.
+
+Hardware target: 4x Tesla K80 (fp32, no quantization).
+Compatible with: transformers==4.38.2, peft==0.7.1
 """
 
 from __future__ import annotations
@@ -17,7 +20,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    BitsAndBytesConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,18 +33,17 @@ def load_and_merge_sft_model(
     """Load the base model and merge the SFT LoRA adapter weights.
 
     Args:
-        base_model_name: HuggingFace model identifier for the base model.
-        adapter_path: Path to the saved LoRA adapter directory.
-        device_map: Device mapping strategy (default: 'auto').
+        base_model_name: HuggingFace model identifier.
+        adapter_path: Path to saved LoRA adapter directory.
+        device_map: Device mapping strategy.
 
     Returns:
-        A tuple of (merged_model, tokenizer) where the model has LoRA
-        weights merged into the base weights.
+        Tuple of (merged_model, tokenizer).
     """
-    logger.info("Loading base model: %s", base_model_name)
+    logger.info("Loading base model in fp32: %s", base_model_name)
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         device_map=device_map,
         trust_remote_code=True,
     )
@@ -67,54 +68,41 @@ def load_reward_model(
     adapter_path: str,
     freeze_layers_except_last_n: int = 2,
     device_map: str = "auto",
-    load_in_4bit: bool = True,
+    load_in_4bit: bool = False,
 ) -> tuple[AutoModelForSequenceClassification, AutoTokenizer]:
-    """Load a reward model based on the merged SFT checkpoint.
+    """Load a reward model based on the merged SFT checkpoint (fp32).
 
     Uses AutoModelForSequenceClassification with num_labels=1 for scalar
-    reward prediction. Freezes all layers except the classification head
-    and the last N transformer blocks.
+    reward prediction. No quantization for K80 compatibility.
 
     Args:
         base_model_name: HuggingFace model identifier.
         adapter_path: Path to the SFT LoRA adapter directory.
         freeze_layers_except_last_n: Number of final transformer blocks
-            to keep trainable (in addition to the reward head).
+            to keep trainable.
         device_map: Device mapping strategy.
-        load_in_4bit: Whether to load in 4-bit quantization.
+        load_in_4bit: Ignored (always fp32 for K80).
 
     Returns:
-        A tuple of (reward_model, tokenizer).
+        Tuple of (reward_model, tokenizer).
     """
-    logger.info("Building reward model from SFT checkpoint")
-
-    # Configure quantization
-    bnb_config = None
-    if load_in_4bit:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
+    logger.info("Building reward model from SFT checkpoint (fp32)")
 
     # Load as sequence classification model with 1 output (scalar reward)
     model = AutoModelForSequenceClassification.from_pretrained(
         base_model_name,
         num_labels=1,
-        quantization_config=bnb_config,
         device_map=device_map,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
     )
 
-    # Load tokenizer from adapter path (has any special tokens added during SFT)
+    # Load tokenizer from adapter path
     tokenizer = AutoTokenizer.from_pretrained(adapter_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Set pad token ID in model config
     model.config.pad_token_id = tokenizer.pad_token_id
 
     # Freeze layers
@@ -140,32 +128,29 @@ def _freeze_model_layers(
     """Freeze all transformer layers except the last N and the classification head.
 
     Args:
-        model: The transformer model with a classification head.
+        model: The transformer model.
         keep_last_n: Number of final transformer blocks to keep trainable.
     """
-    # First, freeze everything
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze the classification/score head
+    # Unfreeze classification/score head
     for name, param in model.named_parameters():
         if "score" in name or "classifier" in name or "reward" in name:
             param.requires_grad = True
             logger.debug("Unfreezing: %s", name)
 
     # Unfreeze last N transformer blocks
-    # Different model architectures use different naming conventions
     layer_patterns = [
-        "model.layers",        # Llama, Mistral
-        "transformer.h",       # GPT-2
-        "model.decoder.layers",  # OPT
+        "model.layers",
+        "transformer.h",
+        "model.decoder.layers",
     ]
 
     for pattern in layer_patterns:
         layers = []
         for name, param in model.named_parameters():
             if pattern in name:
-                # Extract layer index
                 parts = name.split(".")
                 for i, part in enumerate(parts):
                     if part == pattern.split(".")[-1]:
@@ -183,7 +168,7 @@ def _freeze_model_layers(
                     logger.debug("Unfreezing layer %d: %s", layer_idx, name)
             break
 
-    # Also unfreeze the final layer norm
+    # Unfreeze final layer norm
     for name, param in model.named_parameters():
         if "norm" in name.lower() and ("final" in name.lower() or "ln_f" in name.lower()):
             param.requires_grad = True
