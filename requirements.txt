@@ -1,35 +1,29 @@
-# RLHF Pipeline — Python Dependencies
-# Pin major versions for reproducibility
+# RLHF Pipeline — Python Dependencies (K80-compatible)
+# Target: 4x Tesla K80, CUDA 11.4, CC 3.7
+# Install torch first: pip install torch==1.12.1+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html
 
-# Core ML
-torch>=2.2.0
-transformers>=4.41.0
-datasets>=2.19.0
-accelerate>=0.30.0
-peft>=0.11.0
-trl>=0.9.0
-bitsandbytes>=0.43.0
+# Core ML (pinned for K80 / torch 1.12 compatibility)
+torch==1.12.1+cu113
+transformers==4.38.2
+datasets==2.18.0
+accelerate==0.27.2
+peft==0.7.1
+trl==0.7.11
 sentencepiece>=0.2.0
 protobuf>=4.25.0
 safetensors>=0.4.0
 
 # Experiment tracking
-mlflow>=2.14.0
+mlflow==2.11.4
 
 # Pipeline orchestration
 dvc>=3.50.0
-dvc-s3>=3.2.0  # optional: for S3 remote
-
-# Evaluation
-langsmith>=0.1.0
-langchain>=0.2.0
-langchain-openai>=0.1.0
 
 # Monitoring
 prometheus-client>=0.20.0
 
 # Data & Visualization
-numpy>=1.26.0
+numpy<2.0
 pandas>=2.2.0
 matplotlib>=3.8.0
 seaborn>=0.13.0
@@ -39,11 +33,7 @@ scipy>=1.13.0
 # Development
 pytest>=8.2.0
 pyyaml>=6.0.1
-pydantic>=2.7.0
 tqdm>=4.66.0
-typing-extensions>=4.11.0
 
-# Jupyter
-jupyter>=1.0.0
-ipykernel>=6.29.0
-nbformat>=5.10.0
+# NOTE: bitsandbytes NOT included — K80 uses fp32 training (no quantization)
+# NOTE: No fp16 — K80 has no tensor cores

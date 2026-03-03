@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 def load_and_merge_sft_model(
     base_model_name: str,
     adapter_path: str,
-    device_map: str = "auto",
+    device_map: str | None = None,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """Load the base model and merge the SFT LoRA adapter weights.
 
@@ -67,7 +67,7 @@ def load_reward_model(
     base_model_name: str,
     adapter_path: str,
     freeze_layers_except_last_n: int = 2,
-    device_map: str = "auto",
+    device_map: str | None = None,
     load_in_4bit: bool = False,
 ) -> tuple[AutoModelForSequenceClassification, AutoTokenizer]:
     """Load a reward model based on the merged SFT checkpoint (fp32).

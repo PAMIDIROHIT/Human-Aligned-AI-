@@ -1,9 +1,11 @@
 stages:
   stage1_sft:
-    cmd: python -m src.stage1_sft.train --config params.yaml
+    cmd: accelerate launch --config_file accelerate_config.yaml -m src.stage1_sft.train --config params.yaml
     deps:
       - src/stage1_sft/train.py
       - src/stage1_sft/dataset.py
+      - data/sft/ultrachat_200k
+      - data/sft/openassistant_guanaco
       - params.yaml
     params:
       - sft
@@ -34,11 +36,13 @@ stages:
           cache: false
 
   stage2_reward:
-    cmd: python -m src.stage2_reward.train --config params.yaml
+    cmd: accelerate launch --config_file accelerate_config.yaml -m src.stage2_reward.train --config params.yaml
     deps:
       - src/stage2_reward/train.py
       - src/stage2_reward/dataset.py
       - src/stage2_reward/model.py
+      - data/reward/anthropic_hh_rlhf
+      - data/reward/ultrafeedback_binarized
       - models/sft_adapter
       - params.yaml
     params:
@@ -70,6 +74,8 @@ stages:
       - src/stage3_ppo/train.py
       - src/stage3_ppo/dataset.py
       - src/stage3_ppo/kl_controller.py
+      - data/ppo/ultrafeedback_binarized_gen
+      - data/ppo/pku_saferlhf
       - models/sft_adapter
       - models/reward_model
       - params.yaml
@@ -86,10 +92,7 @@ stages:
       - reports/ppo_training_curves.csv:
           cache: false
           x: step
-          y:
-            - mean_reward
-            - kl_divergence
-            - policy_entropy
+          y: mean_reward
 
   stage3_eval:
     cmd: python -m src.stage3_ppo.evaluate --config params.yaml

@@ -18,7 +18,7 @@ scrape_configs:
   # RLHF Training Metrics (exposed by PPO training script)
   - job_name: "rlhf-training"
     static_configs:
-      - targets: ["<GPU_SERVER_IP>:9091"]
+      - targets: ["10.0.24.7:9091"]
         labels:
           instance: "campus-gpu-server"
           project: "rlhf-pipeline"
@@ -26,7 +26,7 @@ scrape_configs:
   # MLflow Metrics (if MLflow server is running)
   - job_name: "mlflow"
     static_configs:
-      - targets: ["<GPU_SERVER_IP>:5000"]
+      - targets: ["10.0.24.7:5000"]
         labels:
           instance: "campus-gpu-server"
           service: "mlflow"

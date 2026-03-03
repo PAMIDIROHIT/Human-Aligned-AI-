@@ -1,15 +1,14 @@
-# Accelerate configuration for 4x Tesla K80 GPUs
+# Accelerate configuration for Tesla K80 GPUs (accelerate 0.27.2)
+# GPU 0 has ~5GB used by another process, so we use GPUs 1,2,3
 # Use with: accelerate launch --config_file accelerate_config.yaml <script>
 compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
 downcast_bf16: 'no'
-gpu_ids: all
+gpu_ids: 1,2,3
 machine_rank: 0
-main_training_port: 29500
 mixed_precision: 'no'
 num_machines: 1
-num_processes: 4
-rdzv_backend: static
+num_processes: 3
 same_network: true
 tpu_env: []
 tpu_use_cluster: false

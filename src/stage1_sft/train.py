@@ -27,6 +27,7 @@ import mlflow
 import torch
 import yaml
 from peft import LoraConfig, TaskType, get_peft_model
+from prometheus_client import Gauge, start_http_server
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -106,35 +107,37 @@ def load_config(config_path: str) -> SFTConfig:
     t = s.get("training", {})
     e = s.get("eval_gate", {})
 
+    _defaults = SFTConfig()
+
     return SFTConfig(
-        base_model=g.get("base_model", SFTConfig.base_model),
-        seed=g.get("seed", SFTConfig.seed),
-        max_seq_length=g.get("max_seq_length", SFTConfig.max_seq_length),
-        output_dir=s.get("output_dir", SFTConfig.output_dir),
-        experiment_name=s.get("experiment_name", SFTConfig.experiment_name),
-        mlflow_tracking_uri=g.get("mlflow_tracking_uri", SFTConfig.mlflow_tracking_uri),
-        lora_r=lora.get("r", SFTConfig.lora_r),
-        lora_alpha=lora.get("lora_alpha", SFTConfig.lora_alpha),
-        target_modules=lora.get("target_modules", SFTConfig.target_modules),
-        lora_dropout=lora.get("lora_dropout", SFTConfig.lora_dropout),
-        lora_bias=lora.get("bias", SFTConfig.lora_bias),
-        per_device_train_batch_size=t.get("per_device_train_batch_size", SFTConfig.per_device_train_batch_size),
-        gradient_accumulation_steps=t.get("gradient_accumulation_steps", SFTConfig.gradient_accumulation_steps),
-        warmup_ratio=t.get("warmup_ratio", SFTConfig.warmup_ratio),
-        num_train_epochs=t.get("num_train_epochs", SFTConfig.num_train_epochs),
-        learning_rate=t.get("learning_rate", SFTConfig.learning_rate),
-        fp16=t.get("fp16", SFTConfig.fp16),
-        packing=t.get("packing", SFTConfig.packing),
-        logging_steps=t.get("logging_steps", SFTConfig.logging_steps),
-        save_strategy=t.get("save_strategy", SFTConfig.save_strategy),
-        evaluation_strategy=t.get("evaluation_strategy", SFTConfig.evaluation_strategy),
-        optim=t.get("optim", SFTConfig.optim),
-        weight_decay=t.get("weight_decay", SFTConfig.weight_decay),
-        max_grad_norm=t.get("max_grad_norm", SFTConfig.max_grad_norm),
-        lr_scheduler_type=t.get("lr_scheduler_type", SFTConfig.lr_scheduler_type),
-        gradient_checkpointing=t.get("gradient_checkpointing", SFTConfig.gradient_checkpointing),
-        val_split_ratio=e.get("val_split_ratio", SFTConfig.val_split_ratio),
-        max_perplexity=e.get("max_perplexity", SFTConfig.max_perplexity),
+        base_model=g.get("base_model", _defaults.base_model),
+        seed=g.get("seed", _defaults.seed),
+        max_seq_length=g.get("max_seq_length", _defaults.max_seq_length),
+        output_dir=s.get("output_dir", _defaults.output_dir),
+        experiment_name=s.get("experiment_name", _defaults.experiment_name),
+        mlflow_tracking_uri=g.get("mlflow_tracking_uri", _defaults.mlflow_tracking_uri),
+        lora_r=lora.get("r", _defaults.lora_r),
+        lora_alpha=lora.get("lora_alpha", _defaults.lora_alpha),
+        target_modules=lora.get("target_modules", _defaults.target_modules),
+        lora_dropout=lora.get("lora_dropout", _defaults.lora_dropout),
+        lora_bias=lora.get("bias", _defaults.lora_bias),
+        per_device_train_batch_size=t.get("per_device_train_batch_size", _defaults.per_device_train_batch_size),
+        gradient_accumulation_steps=t.get("gradient_accumulation_steps", _defaults.gradient_accumulation_steps),
+        warmup_ratio=t.get("warmup_ratio", _defaults.warmup_ratio),
+        num_train_epochs=t.get("num_train_epochs", _defaults.num_train_epochs),
+        learning_rate=t.get("learning_rate", _defaults.learning_rate),
+        fp16=t.get("fp16", _defaults.fp16),
+        packing=t.get("packing", _defaults.packing),
+        logging_steps=t.get("logging_steps", _defaults.logging_steps),
+        save_strategy=t.get("save_strategy", _defaults.save_strategy),
+        evaluation_strategy=t.get("evaluation_strategy", _defaults.evaluation_strategy),
+        optim=t.get("optim", _defaults.optim),
+        weight_decay=t.get("weight_decay", _defaults.weight_decay),
+        max_grad_norm=t.get("max_grad_norm", _defaults.max_grad_norm),
+        lr_scheduler_type=t.get("lr_scheduler_type", _defaults.lr_scheduler_type),
+        gradient_checkpointing=t.get("gradient_checkpointing", _defaults.gradient_checkpointing),
+        val_split_ratio=e.get("val_split_ratio", _defaults.val_split_ratio),
+        max_perplexity=e.get("max_perplexity", _defaults.max_perplexity),
         _raw_config=params,
     )
 
@@ -190,7 +193,67 @@ def create_training_args(cfg: SFTConfig) -> TrainingArguments:
         greater_is_better=False,
         gradient_checkpointing=cfg.gradient_checkpointing,
         ddp_find_unused_parameters=False,
+        dataloader_num_workers=2,
+        dataloader_prefetch_factor=2,
     )
+
+
+# --------------- Prometheus gauges (shared across callbacks) ---------------
+_PROM_LOSS = Gauge("rlhf_sft_train_loss", "SFT training loss")
+_PROM_LR = Gauge("rlhf_sft_learning_rate", "SFT learning rate")
+_PROM_EPOCH = Gauge("rlhf_sft_epoch", "SFT current epoch")
+_PROM_STEP = Gauge("rlhf_sft_global_step", "SFT global training step")
+_PROM_GRAD_NORM = Gauge("rlhf_sft_grad_norm", "SFT gradient norm")
+_PROM_EVAL_LOSS = Gauge("rlhf_sft_eval_loss", "SFT evaluation loss")
+_PROM_EVAL_PPL = Gauge("rlhf_sft_eval_perplexity", "SFT evaluation perplexity")
+_PROM_GPU_MEM = Gauge("rlhf_sft_gpu_memory_gb", "GPU memory used (GB)", ["gpu"])
+
+_prom_server_started = False
+
+
+def _start_prometheus_server(port: int = 9091) -> None:
+    """Start Prometheus HTTP metrics server (only on rank 0)."""
+    global _prom_server_started
+    if _prom_server_started:
+        return
+    rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    if rank != 0:
+        return
+    try:
+        start_http_server(port, addr="0.0.0.0")
+        _prom_server_started = True
+        logger.info("Prometheus metrics server started on port %d", port)
+    except OSError as e:
+        logger.warning("Could not start Prometheus server on port %d: %s", port, e)
+
+
+class PrometheusCallback(TrainerCallback):
+    """Exports live training metrics to Prometheus on port 9091."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        _start_prometheus_server(9091)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        if "loss" in logs:
+            _PROM_LOSS.set(logs["loss"])
+        if "learning_rate" in logs:
+            _PROM_LR.set(logs["learning_rate"])
+        if "epoch" in logs:
+            _PROM_EPOCH.set(logs["epoch"])
+        if "grad_norm" in logs:
+            _PROM_GRAD_NORM.set(logs["grad_norm"])
+        if "eval_loss" in logs:
+            _PROM_EVAL_LOSS.set(logs["eval_loss"])
+            ppl = torch.exp(torch.tensor(logs["eval_loss"])).item()
+            _PROM_EVAL_PPL.set(ppl)
+        _PROM_STEP.set(state.global_step)
+        # GPU memory
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                mem_gb = torch.cuda.memory_allocated(i) / 1e9
+                _PROM_GPU_MEM.labels(gpu=str(i)).set(round(mem_gb, 2))
 
 
 class MLflowLoggingCallback(TrainerCallback):
@@ -280,7 +343,6 @@ def train_sft(cfg: SFTConfig) -> None:
         model = AutoModelForCausalLM.from_pretrained(
             cfg.base_model,
             torch_dtype=torch.float32,
-            device_map="auto",
             trust_remote_code=True,
         )
         model.config.use_cache = False
@@ -305,8 +367,9 @@ def train_sft(cfg: SFTConfig) -> None:
         # Training arguments
         training_args = create_training_args(cfg)
 
-        # MLflow callback
+        # Callbacks
         mlflow_callback = MLflowLoggingCallback()
+        prom_callback = PrometheusCallback()
 
         # Create SFTTrainer (TRL 0.7.11 API)
         logger.info("Initializing SFTTrainer with packing=%s", cfg.packing)
@@ -319,7 +382,7 @@ def train_sft(cfg: SFTConfig) -> None:
             packing=cfg.packing,
             max_seq_length=cfg.max_seq_length,
             dataset_text_field="text",
-            callbacks=[mlflow_callback],
+            callbacks=[mlflow_callback, prom_callback],
         )
 
         # Train
