@@ -1,5 +1,0 @@
-Metadata-Version: 2.1
-Name: human-aligned-ai
-Version: 0.1.0
-Summary: End-to-End RLHF Pipeline for Human-Aligned AI
-Requires-Python: >=3.9
